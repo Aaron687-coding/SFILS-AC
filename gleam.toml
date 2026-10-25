@@ -1,0 +1,8 @@
+name = "sfils_ac_aaron"
+version = "1.0.0"
+
+[dependencies]
+gleam_stdlib = "1.0.5"
+sqlight = ">= 1.2.0 and < 2.0.0"
+gsv = ">= 5.1.0 and < 6.0.0"
+simplifile = ">= 2.7.0 and < 3.0.0"
