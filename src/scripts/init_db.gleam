@@ -1,4 +1,4 @@
-import gleam/io
+// import gleam/io
 import gleam/list
 
 // Used to map rows back to Gleam types
@@ -86,9 +86,10 @@ pub fn create_db() {
 
   // Stops at the first failing statement and crashes with its error
   let assert Ok(Nil) = list.try_each(table_ops, fn(res) { res })
-}
 
-pub fn main() {
-  create_db()
-  io.println("Database ready to receive text commands!")
+  Ok(Nil)
 }
+// pub fn main() {
+//   create_db()
+//   io.println("Database ready to receive text commands!")
+// }

@@ -2,12 +2,9 @@
 patron_type_code","Patron Type Definition
 ","Total Checkouts
 checkout_total","Total Renewals
-renewal_total","Age Range
-","Home Library Code
-home_library_code","Home Library Definition
-","Circulation Active Month
-","Circulation Active Year
-","Notification Preference Code
+renewal_total","Age Range","Home Library Code
+home_library_code","Home Library Definition","Circulation Active Month
+","Circulation Active Year","Notification Preference Code
 notification_medium_code",Notification Code Definition,"Provided Email Address
 ",Within San Francisco County,Year Patron Registered
 1,Juvenile,0,0,0 to 9 years,r3,Richmond, ,,z,Email,True,True,2022
