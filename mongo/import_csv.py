@@ -200,7 +200,7 @@ def verify_import(collection: Collection) -> None:
             problems.append(f"  {age_range}: expected {expected}, got {actual}")
     unexpected_ranges = sorted(set(ar_stats) - set(known_ar_stats))
     if unexpected_ranges:
-        problems.append(f"  unexpected age ranges in data: {unexpected_ranges}")
+        problems.append(f"\tunexpected age ranges in data: {unexpected_ranges}")
     if problems:
         raise ValueError("Age range counts are incorrect:\n" + "\n".join(problems))
 
