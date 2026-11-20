@@ -67,6 +67,7 @@ SQLite:
 - **No secondary indexes yet.** Only the primary-key indexes exist.
 - **Dropped columns.** `Circulation Active Month/Year` and `Provided Email Address` are kept only in the raw table `library_basic.db`; they are not in `library.db` or the app.
 - **Updates and deletes are permanent** (there is no undo); the original data can be rebuilt from the CSV (see `app/README.md`).
+
 MongoDB:
  
 - **No secondary indexes yet.** Only the automatic index on `_id` exists, so every filtered query reads the whole collection.
