@@ -86,35 +86,38 @@ Splitting the repeated text (patron type definitions, library names, notificatio
 | `library_basic` |  182.6 MB |         30.4 MB | the spreadsheet loaded as-is into one table (14 columns) |
 | `library`       |  133.3 MB |         24.2 MB | documents with shorter field names and nested fields     |
 
-Reducing the number of characters taken by field names through reduction (e.g., `within_san_francisco` -> `within_sf`) and nested fields (e.g., `patron_type_code`, `patron_type_definition` -> `patron`: {`code`, `definition`}) made the size of the database about **26%** smaller than the single table version (24.2 MB vs 30.4 MB). The tables could be made even smaller by creating lookup tables, similar to the SQLite implementation, at the cost of an additional `$lookup` or in-memory dictionary.
+MongoDB stores the field names inside every document, so shortening them (e.g., `within_san_francisco_county` -> `within_sf`) and grouping related fields into sub-documents (e.g., `patron_type_code`, `patron_type_definition` -> `patron`: {`code`, `type`}) makes the documents about **27%** smaller before compression (133.3 MB vs 182.6 MB). On disk the saving is about **20%** (24.2 MB vs 30.4 MB), because MongoDB compresses its data files and repeated field names compress well in either shape.
+
+Compared with SQLite, `library` takes about 50% more space on disk than `library.db` (24.2 MB vs 16.1 MB) even after compression, because every document still carries its definitions. The collection could be made smaller by moving the definitions into lookup collections, similar to the SQLite implementation, at the cost of an additional `$lookup` or an in-memory dictionary.
 
 ### Query time
 
-The query "average checkouts of Richmond patrons aged 25 to 34" (3,599 rows) joins `UserTransaction` to `HomeLibType`. It took **0.03 s** in each of three runs (`sqlite3`, whole process including start-up), over the full 437,115-row table. The plan scans `UserTransaction` once and looks up each library code through the primary-key index of `HomeLibType`.
+SQLite: the query "average checkouts of Richmond patrons aged 25 to 34" (3,599 rows) joins `UserTransaction` to `HomeLibType`. It took **0.03 s** in each of three runs (`sqlite3`, whole process including start-up), over the full 437,115-row table. The plan scans `UserTransaction` once and looks up each library code through the primary-key index of `HomeLibType`.
 
-The same query on a single `library` table took an average of **0.07 s** in each of three runs (`mongodb`, whole process including network round trip), over the full 437,115-row table. The plan scans the `library` table once, matching for `Richmond` patrons between 25 and 34, before processing matched rows.
+MongoDB: the same query on the `library` collection took **0.07 s** on average over three runs (timed from Python, including the network round trip to the server but not start-up), over all 437,115 documents. No join is needed, because the library name is stored in every document. The plan scans the whole collection once, keeps the documents for Richmond patrons aged 25 to 34, and averages their checkouts.
+
+The two times were not measured in the same way (a whole `sqlite3` process against one call from a Python program that is already running), so they show that both are fast at this size, more than which one is faster.
 
 ### Building the database
 
-`gleam run` (create the tables, load all 437,115 CSV rows, fill the normalised tables) took **13 s** when the dependencies were already compiled, and around **25 s** on a first run from a clean copy, which includes about 10 s of compiling. The inserts are fast because they all share one transaction.
+SQLite: `gleam run` (create the tables, load all 437,115 CSV rows, fill the normalised tables) took **13 s** when the dependencies were already compiled, and around **25 s** on a first run from a clean copy, which includes about 10 s of compiling. The inserts are fast because they all share one transaction.
 
-`import_csv.py` (creates the database and raw table, loads all CSV rows, verifies rows) and`init_db.py` (creates the `library` table and loads raw rows) took 5.1 and 4.5 s, respectively, for a total of **9.5 s**. 
+MongoDB: `import_csv.py` (create the raw collection, load all 437,115 CSV rows, verify them) took 5.1 s and `init_db.py` (create the `library` collection and fill it from the raw collection) took 4.5 s, for a total of **9.5 s**. The inserts are fast because they are sent in batches of 10,000 documents.
 
 ### App speed
 
-In SQLIte, on the full table (437,115 rows, no filters), `view stats` takes **0.63 s** (including starting the app and reading all three numeric columns to compute medians and percentiles), and showing the first page of `view results` takes **0.21 s**.
+In SQLite, on the full table (437,115 rows, no filters), `view stats` takes **0.63 s** (including starting the app and reading all three numeric columns to compute medians and percentiles), and showing the first page of `view results` takes **0.21 s**.
 
-In MongoDB, on the full table (437,115 rows, no filters), `view stats` takes **1.65 s** (including starting the app and reading all three numeric columns to compute medians and percentiles), and showing the first page of `view results` takes **1.14 s**.
+In MongoDB, on the full collection (437,115 documents, no filters), `view stats` takes **1.65 s** (including starting the app and reading all three numeric fields to compute medians and percentiles), and showing the first page of `view results` takes **1.14 s**.
+
+In the case of MongoDB, most of the time is spent on start-up; before its first command, the app scans the collection several times to load the possible values of each filter field, the minimum and maximum of each numeric field, and the document count, and with no indexes each of these reads all 437,115 documents.
 
 ### Not done yet
 
-- **No secondary indexes.** Only the primary-key indexes exist (`PatronType`, `HomeLibType`, `NotificationType`). Queries are fast enough at this size, but indexes on the `UserTransaction` foreign-key columns (and on the columns the app filters on) have not been added or measured, so there is no before/after comparison yet.
-- **Not MySQL.** The figures are for SQLite. Re-measuring on MySQL/MariaDB (with and without indexes, using `EXPLAIN`) is the main remaining work for this assignment.
-
-
-
-- **No indexes.** For the MongoDB implementation, no indexes were created or used, meaning reads, sorting and filtering were slower than they would have been. 
+- **No secondary indexes (SQLite).** Only the primary-key indexes exist (`PatronType`, `HomeLibType`, `NotificationType`). Queries are fast enough at this size, but indexes on the `UserTransaction` foreign-key columns (and on the columns the app filters on) have not been added or measured, so there is no before/after comparison yet.
+- **No secondary indexes (MongoDB).** Only the automatic index on `_id` exists, so every filter, sort and start-up query reads the whole collection. Indexes on the fields the app filters on have not been added or measured.
+- **Not MySQL.** The Assignment 1 figures are for SQLite. Re-measuring on MySQL/MariaDB (with and without indexes, using `EXPLAIN`) is the main remaining work for that assignment.
 
 ## Exported results
 
-Files written by the app's `export` command are saved in this folder as `export_<date>_<time>.csv` or by the name of your choice.
+Files written by either app's `export` command are saved in this folder as `export_<date>_<time>.csv` or by the name of your choice.

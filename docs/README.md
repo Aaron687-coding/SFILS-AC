@@ -67,9 +67,9 @@ These programs import entries from the CSV document into `library_database` on a
 3. `init_db.init_db()`:  drops and recreates a `library` collection, inserting documents from `library_basic` to `library` using `insert_docs()`.
 
 Both steps are safe to repeat: each one drops its collection first, so nothing is duplicated.
- 
+
 To collect the performance figures (storage, query time, app speed, and build time with `--build`):
- 
+
 ```sh
 python3 mongo/metrics.py            # add --build to also time a full rebuild (this drops both collections)
 ```
@@ -100,14 +100,14 @@ Design notes:
 ### MongoDB
 
 `library_database` has two collections, each with one document per row of the spreadsheet:
- 
+
 | Collection | Documents | Shape | Used for |
 |---|---|---|---|
 | `library_basic` | 437,115 | flat, 14 spreadsheet columns as 14 fields | importing the CSV with minimal processing |
 | `library` | 437,115 | nested, related fields grouped into sub-documents | everything `mongo/main.py` reads, updates and deletes |
- 
+
 One document from `library` looks like this:
- 
+
 ```js
 {
   _id: 0, // row number, the same in both collections
@@ -136,8 +136,8 @@ The data is stored by the MongoDB server in its own data folder, so there are no
 ## Using the app
 
 Both apps (`app/main.py` and `mongo/main.py`) have the same commands. Type a command or just its beginning, and press Tab to complete it.
- 
-|| Command | What it does |
+
+| Command | What it does |
 |---|---|
 | `set filters` | Choose which rows to look at. Pick a field, then values. Text fields show every possible value and autocomplete them; numeric fields show the minimum and maximum in the database. Enter keeps a default, `clear` removes the filter. |
 | `show filters` | Show the current filters, the sort order, and how many rows match. |
