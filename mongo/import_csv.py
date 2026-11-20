@@ -250,5 +250,5 @@ def import_csv_basic(collection_str: str = "library_basic") -> None:
     finally:
         client.close()  # always close
 
-# if __name__ == "__main__":
-#     import_csv_basic("library_basic")
+if __name__ == "__main__":
+    import_csv_basic("library_basic")

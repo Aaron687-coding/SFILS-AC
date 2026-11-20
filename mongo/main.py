@@ -1,24 +1,31 @@
-"""Terminal app for querying, updating and deleting rows in the SFPL
-library-usage database (SQLite, library.db).
+"""Terminal app for querying, updating and deleting documents in the SFPL
+library-usage database (MongoDB, library_database.library).
 
 Run it from anywhere with:   python3 mongo/main.py
-If library.db does not exist yet, the Gleam project is run to build it.
+If the collection does not exist yet, import_csv.py and init_db.py are run
+to build it (MongoDB itself has to be running already).
 
-Searching, statistics and export use a READ-ONLY connection. Only the
-update/delete commands change the database (through a separate connection),
-and each of them asks for a typed confirmation first.
+Searching, statistics and export go through a READ-ONLY wrapper around the
+collection. Only the update/delete commands change the database (through the
+real collection), and each of them asks for a typed confirmation first.
 """
 
 import csv
 import difflib
 import math
 import readline
-import shutil
-import pymongo
 import statistics
-import subprocess
 from datetime import datetime
 from pathlib import Path
+
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
+
+# import_csv.py and init_db.py sit next to this file (Python puts the folder
+# of the script that was started on its import path)
+from import_csv import import_csv_basic
+from init_db import (COLLECTION_NAME, CONNECTION_STRING, DATABASE_NAME,
+                     RAW_COLLECTION_NAME, init_db)
 
 # ------------------------------------------------------ PATHS & CONSTANTS -------------------------------------------------
 
@@ -26,15 +33,16 @@ from pathlib import Path
 # which folder you start the app from
 APP_DIR = Path(__file__).resolve().parent
 REPO_DIR = APP_DIR.parent
-DB_PATH = REPO_DIR / "library.db"
 RESULTS_DIR = REPO_DIR / "results"
 
 PAGE_SIZE = 20          # rows shown per page in "view results"
 UNKNOWN = "(unknown)"   # what we show for a blank age range
 
-# The open READ-ONLY connection used for all searching, set in main().
-# (Changes go through open_writable() instead.)
-CONN = None
+# Set in main(). COLL is the READ-ONLY wrapper used for all searching;
+# changes go through writable_collection() instead.
+CLIENT = None
+COLL = None
+_REAL_COLLECTION = None
 
 # Filled in at startup with the real values from the database, so the user
 # never has to guess what is valid
@@ -42,65 +50,47 @@ CHOICES = {}   # field name -> list of possible values (strings)
 RANGES = {}    # numeric field name -> (minimum, maximum)
 TOTAL_ROWS = 0
 
-# Fields with a list of possible values: choice name: [column name, table name]
-SQLITE_COMMANDS = {
-    "age ranges": ["age_range", "PatronType"],
-    "patron types": ["patron_type_definition", "PatronType"],
-    "library names": ["home_library_name", "HomeLibType"],
-    "notification types": ["notification_medium_definition", "NotificationType"],
+# Fields with a list of possible values: choice name -> field path in a document
+# ("patron.age_range" means the age_range field inside the patron sub-document)
+CATEGORY_FIELDS = {
+    "age ranges": "patron.age_range",
+    "patron types": "patron.type",
+    "library names": "library.name",
+    "notification types": "notification.medium",
 }
 
-# Table name -> the short name (alias) it gets in the big query below
-TABLE_ALIASES = {
-    "PatronType": "p",
-    "HomeLibType": "h",
-    "NotificationType": "n",
-}
-
-# Yes/no field (stored as 1/0 in the database)
+# Yes/no field (stored as a real true/false in the database)
 BOOLEAN_FIELD = "within sf"
+BOOLEAN_PATH = "within_sf"
 
-# Numeric fields (the user picks a minimum and maximum): name -> column
+# Numeric fields (the user picks a minimum and maximum): name -> field path
 NUMERIC_FIELDS = {
-    "checkouts": "u.checkout_total",
-    "renewals": "u.renewal_total",
-    "year registered": "u.year_registered",
+    "checkouts": "checkouts",
+    "renewals": "renewals",
+    "year registered": "year_registered",
 }
 
-# Every query reads from the transaction table joined with the three lookup
-# tables, so definitions (like "Juvenile" or "Richmond") are available to
-# filter on and to display. Only the column names and table names we wrote
-# here are ever put into SQL text; anything the user types goes through `?`.
-FROM_SQL = (
-    "FROM UserTransaction u "
-    "JOIN PatronType p ON p.patron_type_code = u.patron_type_code "
-    "AND p.age_range = u.age_range "
-    "JOIN HomeLibType h ON h.home_library_code = u.home_library_code "
-    "JOIN NotificationType n "
-    "ON n.notification_medium_code = u.notification_medium_code "
-)
-
-
-# Columns shown in "view results" and "export": (heading, SQL column)
+# Columns shown in "view results" and "export": (heading, field path).
+# "TID" is the document's _id (kept under the same heading as the SQLite app).
 RESULT_COLUMNS = [
-    ("TID", "u.TID"),
-    ("Patron type", "p.patron_type_definition"),
-    ("Age range", "u.age_range"),
-    ("Library", "h.home_library_name"),
-    ("Notification", "n.notification_medium_definition"),
-    ("Checkouts", "u.checkout_total"),
-    ("Renewals", "u.renewal_total"),
-    ("Within SF", "u.within_sf"),
-    ("Year registered", "u.year_registered"),
+    ("TID", "_id"),
+    ("Patron type", "patron.type"),
+    ("Age range", "patron.age_range"),
+    ("Library", "library.name"),
+    ("Notification", "notification.medium"),
+    ("Checkouts", "checkouts"),
+    ("Renewals", "renewals"),
+    ("Within SF", "within_sf"),
+    ("Year registered", "year_registered"),
 ]
 NUMBER_HEADINGS = {"TID", "Checkouts", "Renewals", "Year registered"}
 
+# Only the fields in RESULT_COLUMNS are fetched for "view results" and "export"
+RESULT_PROJECTION = {path: 1 for _, path in RESULT_COLUMNS}
+
 # Age ranges are text ("10 to 19 years"), which sorts wrongly ("10" < "9"),
-# so sort them by their first number instead (blank ones last)
-SORT_EXPRESSIONS = {
-    "Age range": "CASE WHEN u.age_range = '' THEN 1000 "
-                 "ELSE CAST(u.age_range AS INTEGER) END",
-}
+# so that one heading is sorted by a computed position instead (see fetch_rows)
+AGE_HEADING = "Age range"
 
 # ------------------------------------------------- CURRENT USER SETTINGS --------------------------------------------------
 
@@ -112,68 +102,67 @@ SORT = {"heading": "TID", "direction": "ASC"}
 
 # ---------------------------------------------------- STARTUP FUNCTIONS ---------------------------------------------------
 
-def open_database():
-    """Opens library.db READ-ONLY: SQLite itself refuses any change, no matter
-    what the rest of this program does. (mode=ro also never creates a file.)"""
-    return sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro", uri=True)
+class ReadOnlyCollection:
+    """Gives out only the READING methods of a collection, so the searching
+    code cannot change the database by accident. (MongoDB has no read-only
+    connection mode like SQLite's mode=ro; a truly read-only connection needs
+    a database user with only the 'read' role.)"""
+
+    def __init__(self, collection):
+        self.find = collection.find
+        self.find_one = collection.find_one
+        self.aggregate = collection.aggregate
+        self.count_documents = collection.count_documents
+        self.distinct = collection.distinct
 
 
-def database_is_ready(conn):
-    """True if the tables exist and hold data."""
-    try:
-        return conn.execute("SELECT count(*) FROM UserTransaction").fetchone()[0] > 0
-    except sqlite3.DatabaseError:
-        # e.g. "no such table", or the file is not a database at all
-        return False
+def writable_collection():
+    """The real collection, which CAN be changed. Only update_rows() and
+    delete_rows() call this."""
+    return _REAL_COLLECTION
 
 
-def rebuild_database():
-    """Runs the Gleam project (src/run_me.gleam), which creates library.db."""
-    if shutil.which("gleam") is None:
-        raise SystemExit("Cannot rebuild the database: the 'gleam' command was not "
-                         "found. Install Gleam (and Erlang), or run 'gleam run' yourself.")
+def rebuild_database(db):
+    """Builds the collection: CSV -> library_basic (import_csv.py), then
+    library_basic -> library (init_db.py)."""
+    print("Database not found (or empty)! Building it from the CSV file...")
+    print("(This can take a minute.)")
 
-    print("Database not found (or empty)! Running the Gleam program to build it...")
-    print("(This takes about 15 to 30 seconds.)")
-
-    # `gleam run` has to be started in the folder that contains gleam.toml
-    # (the repo folder), not given a path to a .gleam file
-    result = subprocess.run(
-        ["gleam", "run"],
-        cwd=REPO_DIR,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        print(result.stdout)
-        print(result.stderr)
-        raise SystemExit("The Gleam program failed (see above). If it says that "
-                         "'escript' was not found, Erlang is not on your PATH.")
-
-    print("Gleam program output:")
-    print(result.stdout.strip())
+    if db[RAW_COLLECTION_NAME].estimated_document_count() == 0:
+        import_csv_basic(RAW_COLLECTION_NAME)
+    init_db()
 
 
 def startup():
-    """Makes sure the database is there (building it if needed), loads the
-    lists of possible values, and returns the open connection."""
-    conn = None
-    
-    # Tries to open the database twice
-    for attempt in (1, 2):
-        conn = open_database() if DB_PATH.is_file() else None
-        if conn is not None and database_is_ready(conn):
-            break
-        if conn is not None:
-            conn.close()
-        if attempt == 2:
+    """Connects to MongoDB, makes sure the collection is there (building it if
+    needed), loads the lists of possible values, and returns the open client."""
+    global COLL, _REAL_COLLECTION
+
+    # A MongoClient does not connect until it is first used, so "ping" the
+    # server now to find out straight away if MongoDB is not running
+    client = MongoClient(CONNECTION_STRING, serverSelectionTimeoutMS=5000)
+    try:
+        client.admin.command("ping")
+    except ServerSelectionTimeoutError:
+        client.close()
+        raise SystemExit(f"Cannot reach MongoDB at {CONNECTION_STRING}. "
+                         "Start the MongoDB server (mongod) and try again.")
+
+    db = client[DATABASE_NAME]
+    collection = db[COLLECTION_NAME]
+
+    if collection.estimated_document_count() == 0:
+        rebuild_database(db)
+        if collection.estimated_document_count() == 0:
+            client.close()
             raise SystemExit("The database still is not usable after rebuilding. Exiting.")
-        rebuild_database() # Rebuild if failed to open
+
+    _REAL_COLLECTION = collection
+    COLL = ReadOnlyCollection(collection)
 
     print("Database found. Connected successfully (searches are read-only).")
-    load_choices(conn)
-    return conn
+    load_choices()
+    return client
 
 
 def age_sort_key(age):
@@ -181,29 +170,35 @@ def age_sort_key(age):
     return (1000, age) if not age[:1].isdigit() else (int(age.split()[0]), age)
 
 
-def load_choices(conn):
+def load_choices():
     """Fills CHOICES, RANGES and TOTAL_ROWS from the database."""
     global TOTAL_ROWS
 
-    for choice, (column, table) in SQLITE_COMMANDS.items():
-        # Get distinct age ranges from the database (and replace empty values with UNKNOWN)
-        rows = conn.execute(f"SELECT DISTINCT {column} FROM {table}").fetchall()
-        values = [row[0] for row in rows]
+    for choice, path in CATEGORY_FIELDS.items():
+        values = COLL.distinct(path)
 
         if choice == "age ranges":
-            values = [UNKNOWN if value == "" else value for value in values]
+            # A blank age range is stored as a MISSING field, which distinct()
+            # does not report, so look for one such document ourselves.
+            # ({path: None} matches documents where the field is missing.)
+            if COLL.count_documents({path: None}, limit=1):
+                values.append(UNKNOWN)
             CHOICES[choice] = sorted(values, key=age_sort_key)
         else:
             CHOICES[choice] = sorted(values)
 
     CHOICES[BOOLEAN_FIELD] = ["yes", "no"]
 
-    for field, column in NUMERIC_FIELDS.items():
-        RANGES[field] = conn.execute(
-            f"SELECT min({column}), max({column}) FROM UserTransaction u"
-        ).fetchone()
+    # One pass over the collection for all the minimums and maximums
+    group = {"_id": None}
+    for field, path in NUMERIC_FIELDS.items():
+        group[f"min_{path}"] = {"$min": f"${path}"}
+        group[f"max_{path}"] = {"$max": f"${path}"}
+    result = next(COLL.aggregate([{"$group": group}]), {})
+    for field, path in NUMERIC_FIELDS.items():
+        RANGES[field] = (result.get(f"min_{path}"), result.get(f"max_{path}"))
 
-    TOTAL_ROWS = conn.execute("SELECT count(*) FROM UserTransaction").fetchone()[0]
+    TOTAL_ROWS = COLL.count_documents({})
 
 # ----------------------------------------------- TAB-COMPLETION & PROMPTING ----------------------------------------------
 
@@ -261,33 +256,33 @@ def match_option(text, options):
     for option in options:
         if option.lower() == lowered:
             return option
-    
+
     starts = [option for option in options if option.lower().startswith(lowered)]
     return starts[0] if len(starts) == 1 and lowered else None
 
 
-# ------------------------------------------------------- SQL BUILDING ------------------------------------------------------
+# ------------------------------------------------------ QUERY BUILDING -----------------------------------------------------
 
-def column_for(field):
-    """The SQL column (with table alias) behind a filter field name."""
-    if field in SQLITE_COMMANDS:
-        column, table = SQLITE_COMMANDS[field]
-        return f"{TABLE_ALIASES[table]}.{column}"
-    
+def path_for(field):
+    """The document field path behind a filter field name."""
+    if field in CATEGORY_FIELDS:
+        return CATEGORY_FIELDS[field]
+
     if field == BOOLEAN_FIELD:
-        return "u.within_sf"
-    
+        return BOOLEAN_PATH
+
     return NUMERIC_FIELDS[field]
 
 
-def sql_value(field, shown):
-    """Converts what the user sees ("yes", "(unknown)") to what is stored."""
+def stored_value(field, shown):
+    """Converts what the user sees ("yes", "(unknown)") to what is stored.
+    None stands for "the field is missing" (a blank age range)."""
     if field == BOOLEAN_FIELD:
-        return 1 if shown == "yes" else 0
-    
+        return shown == "yes"
+
     if shown == UNKNOWN:
-        return ""
-    
+        return None
+
     return shown
 
 
@@ -295,45 +290,67 @@ def show_value(field, value):
     """Converts a stored value to what the user sees."""
     if field == BOOLEAN_FIELD:
         return "yes" if value else "no"
-    
-    if value == "" and field == "age ranges":
+
+    if value is None:
         return UNKNOWN
-    
+
     return str(value)
 
 
-def build_where():
-    """Turns the current filters into (" WHERE ...", [values for the ?s])."""
-    clauses, params = [], []
+def build_query():
+    """Turns the current filters into a MongoDB filter document, e.g.
+    {"patron.type": {"$in": ["Teen", "Adult"]}, "checkouts": {"$gte": 0, "$lte": 50}}.
+    Several fields in one filter document are combined with AND. The user's
+    text only ever ends up as a VALUE here, never as a field name or operator."""
+    query = {}
 
     for field, chosen in CATEGORY_FILTERS.items():
-        column = column_for(field)
-        for key, keyword in (("in", "IN"), ("not", "NOT IN")):
-            values = [sql_value(field, shown) for shown in chosen[key]]
+        condition = {}
+        # $in / $nin with None in the list also match / exclude a missing field
+        for key, operator in (("in", "$in"), ("not", "$nin")):
+            values = [stored_value(field, shown) for shown in chosen[key]]
             if values:
-                marks = ", ".join(["?"] * len(values))
-                clauses.append(f"{column} {keyword} ({marks})")
-                params.extend(values)
+                condition[operator] = values
+        if condition:
+            query[path_for(field)] = condition
 
     for field, (low, high) in RANGE_FILTERS.items():
-        clauses.append(f"{column_for(field)} BETWEEN ? AND ?")
-        params.extend([low, high])
+        query[path_for(field)] = {"$gte": low, "$lte": high}
 
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    return where, params
+    return query
 
 
-def order_by():
+def fetch_rows(query, skip=0, limit=None):
+    """The documents matching `query` in the current sort order, as a cursor.
+    `skip`/`limit` pick out one page (limit=None means all the rest)."""
     heading = SORT["heading"]
-    column = dict(RESULT_COLUMNS)[heading]
-    expression = SORT_EXPRESSIONS.get(heading, column)
-    # u.TID at the end keeps the order stable when values are equal
-    return f" ORDER BY {expression} {SORT['direction']}, u.TID"
+    direction = 1 if SORT["direction"] == "ASC" else -1
+
+    if heading != AGE_HEADING:
+        path = dict(RESULT_COLUMNS)[heading]
+        # _id at the end keeps the order stable when values are equal
+        keys = [(path, direction)] if path == "_id" else [(path, direction), ("_id", 1)]
+        cursor = COLL.find(query, RESULT_PROJECTION, allow_disk_use=True).sort(keys).skip(skip)
+        return cursor.limit(limit) if limit else cursor
+
+    # Sorting by age range: sort by each value's position in the (already
+    # correctly ordered) list of age ranges; a missing age range counts as
+    # "(unknown)", which is last in that list
+    position = {"$indexOfArray": [CHOICES["age ranges"],
+                                  {"$ifNull": ["$patron.age_range", UNKNOWN]}]}
+    pipeline = [
+        {"$match": query},
+        {"$project": RESULT_PROJECTION | {"_position": position}},
+        {"$sort": {"_position": direction, "_id": 1}},
+        {"$skip": skip},
+    ]
+    if limit:
+        pipeline.append({"$limit": limit})
+    return COLL.aggregate(pipeline, allowDiskUse=True)
 
 
 def count_matches():
-    where, params = build_where()
-    return CONN.execute(f"SELECT count(*) {FROM_SQL}{where}", params).fetchone()[0]
+    return COLL.count_documents(build_query())
 
 # ------------------------------------------------------ PRINT HELPERS -----------------------------------------------------
 
@@ -341,12 +358,12 @@ def fmt(number, commas=True):
     """12345 -> '12,345'; 3.14159 -> '3.14'; None -> '-'."""
     if number is None:
         return "-"
-    
+
     spec = "," if commas else ""
 
     if isinstance(number, float):
         return format(number, spec + ".2f")
-    
+
     return format(number, spec)
 
 
@@ -375,16 +392,28 @@ def print_in_columns(items):
         print("  " + "".join(item.ljust(width) for item in items[i:i + per_line]).rstrip())
 
 
-def format_result_row(row):
-    """Makes one database row readable (also used for the CSV export)."""
+def get_path(doc, path):
+    """get_path(doc, "patron.type") -> doc["patron"]["type"], or None if any
+    part of the path is missing."""
+    value = doc
+    for key in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def format_result_row(doc):
+    """Makes one document readable (also used for the CSV export)."""
     cells = []
-    for (heading, _), value in zip(RESULT_COLUMNS, row):
+    for heading, path in RESULT_COLUMNS:
+        value = get_path(doc, path)
         if heading == "Within SF":
             cells.append("yes" if value else "no")
-        elif heading == "Age range" and value == "":
+        elif heading == AGE_HEADING and value is None:
             cells.append(UNKNOWN)
         else:
-            cells.append(str(value))
+            cells.append("" if value is None else str(value))
 
     return cells
 
@@ -404,7 +433,7 @@ def describe_filters():
     for field, (low, high) in RANGE_FILTERS.items():
         commas = field != "year registered"
         lines.append(f"  {field}: {fmt(low, commas)} to {fmt(high, commas)}")
-    
+
     return lines
 
 
@@ -416,7 +445,7 @@ def show_filters():
         print("\n".join(lines))
     else:
         print("No filters set (all rows are included).")
-    
+
     print(f"Sorted by: {SORT['heading']} {SORT['direction']}")
     matches = count_matches()
     print(f"Matching rows: {matches:,} of {TOTAL_ROWS:,}")
@@ -534,19 +563,19 @@ def sort_results():
 
     if text == "":
         return
-    
+
     heading = match_option(text, headings)
 
     if heading is None:
         print("Not a column. Choices:", ", ".join(headings))
         return
-    
+
     direction = (ask("asc or desc [asc]: ", ["asc", "desc"]) or "asc").lower()
 
     if direction not in ("asc", "desc"):
         print("Please type asc or desc. Nothing changed.")
         return
-    
+
     SORT["heading"], SORT["direction"] = heading, direction.upper()
     print(f"Sorted by {heading} {direction.upper()}.")
 
@@ -559,19 +588,15 @@ def view_results():
         print("No rows match the current filters.")
         return
 
-    where, params = build_where()
+    query = build_query()
     headings = [heading for heading, _ in RESULT_COLUMNS]
-    columns = ", ".join(column for _, column in RESULT_COLUMNS)
     print(f"{total:,} matching rows (sorted by {SORT['heading']} {SORT['direction']}).")
 
     offset = 0
     while offset < total:
-        rows = CONN.execute(
-            f"SELECT {columns} {FROM_SQL}{where}{order_by()} LIMIT ? OFFSET ?",
-            params + [PAGE_SIZE, offset],
-        ).fetchall()
+        docs = fetch_rows(query, skip=offset, limit=PAGE_SIZE)
         print()
-        print_table(headings, [format_result_row(row) for row in rows], NUMBER_HEADINGS)
+        print_table(headings, [format_result_row(doc) for doc in docs], NUMBER_HEADINGS)
 
         offset += PAGE_SIZE
         if offset >= total:
@@ -609,20 +634,28 @@ def summarize(values):
     }
 
 
-def print_breakdown(field, where, params, total):
-    """Count and averages for each value of one field (like GROUP BY)."""
-    column = column_for(field)
-    order = column if field == "year registered" else "count(*) DESC"
+def print_breakdown(field, query, total):
+    """Count and averages for each value of one field (MongoDB's $group is
+    its GROUP BY)."""
+    path = path_for(field)
+    order = {"_id": 1} if field == "year registered" else {"rows": -1, "_id": 1}
 
-    rows = CONN.execute(
-        f"SELECT {column}, count(*), avg(u.checkout_total), avg(u.renewal_total), "
-        f"sum(u.checkout_total) {FROM_SQL}{where} GROUP BY {column} ORDER BY {order}",
-        params,
-    ).fetchall()
+    groups = COLL.aggregate([
+        {"$match": query},
+        {"$group": {
+            "_id": f"${path}",          # a missing age range groups under None
+            "rows": {"$sum": 1},
+            "avg_checkouts": {"$avg": "$checkouts"},
+            "avg_renewals": {"$avg": "$renewals"},
+            "sum_checkouts": {"$sum": "$checkouts"},
+        }},
+        {"$sort": order},
+    ])
 
-    table = [[show_value(field, value), fmt(count), f"{count / total * 100:.1f}%",
-              fmt(avg_co), fmt(avg_re), fmt(sum_co)]
-             for value, count, avg_co, avg_re, sum_co in rows]
+    table = [[show_value(field, group["_id"]), fmt(group["rows"]),
+              f"{group['rows'] / total * 100:.1f}%", fmt(group["avg_checkouts"]),
+              fmt(group["avg_renewals"]), fmt(group["sum_checkouts"])]
+             for group in groups]
     right = {"rows", "share", "avg checkouts", "avg renewals", "total checkouts"}
     print()
     print_table([field, "rows", "share", "avg checkouts", "avg renewals", "total checkouts"],
@@ -636,7 +669,7 @@ def view_stats():
         print("No rows match the current filters.")
         return
 
-    where, params = build_where()
+    query = build_query()
     print(f"Rows matching: {total:,} of {TOTAL_ROWS:,} ({total / TOTAL_ROWS * 100:.1f}% of the table)")
     lines = describe_filters()
 
@@ -646,11 +679,14 @@ def view_stats():
     else:
         print("Filters: none")
 
-    # One list of numbers per numeric field
-    columns = ", ".join(NUMERIC_FIELDS.values())
-    rows = CONN.execute(f"SELECT {columns} {FROM_SQL}{where}", params).fetchall()
-    stats = {field: summarize([row[i] for row in rows])
-             for i, field in enumerate(NUMERIC_FIELDS)}
+    # One list of numbers per numeric field. Only those fields are fetched,
+    # and the statistics are worked out here in Python (as in the SQLite app).
+    projection = {"_id": 0} | {path: 1 for path in NUMERIC_FIELDS.values()}
+    values = {field: [] for field in NUMERIC_FIELDS}
+    for doc in COLL.find(query, projection):
+        for field, path in NUMERIC_FIELDS.items():
+            values[field].append(doc[path])
+    stats = {field: summarize(values[field]) for field in NUMERIC_FIELDS}
 
     stat_names = ["sum", "mean", "median", "stdev", "min", "max",
                   "90th percentile", "99th percentile"]
@@ -684,74 +720,61 @@ def view_stats():
         if field is None:
             print("  Not a field. Choices:", ", ".join(group_fields))
         else:
-            print_breakdown(field, where, params, total)
+            print_breakdown(field, query, total)
 
 
 # ------------------------------------------------- UPDATING & DELETING ------------------------------------------------
 
 # The update/delete commands are the ONLY code that changes the database. They
-# use a second, short-lived connection (open_writable) so that everything else
-# in this program stays read-only.
+# use writable_collection(), so that everything else in this program stays
+# read-only.
 
 MIN_YEAR = 1900              # earliest "year registered" that update accepts
 MAX_COUNT = 2_147_483_647    # largest checkout/renewal total that update accepts
 
 
-def open_writable():
-    """Opens a connection that CAN change library.db (mode=rw never creates a
-    new file). SQLite leaves foreign keys off unless asked, on every connection,
-    so turn them on: that is what stops an invalid patron type / age range."""
-    conn = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=rw", uri=True)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def plain_column(column):
-    """'u.checkout_total' -> 'checkout_total' (UPDATE needs the bare name)."""
-    return column.split(".")[-1]
-
-
 def edit_fields():
     """The fields update can change (same names as the filters use)."""
-    return list(NUMERIC_FIELDS) + list(SQLITE_COMMANDS) + [BOOLEAN_FIELD]
+    return list(NUMERIC_FIELDS) + list(CATEGORY_FIELDS) + [BOOLEAN_FIELD]
 
 
 def refresh_after_change():
-    """Reloads the row count and min/max values, which a change can alter."""
-    load_choices(CONN)
+    """Reloads the row count, choices and min/max values, which a change can alter."""
+    load_choices()
 
 
 def scope_row():
     """Asks for a TID and shows that row. Returns a 'scope' (which rows to
     change) or None if cancelled."""
-    first, last = CONN.execute("SELECT min(TID), max(TID) FROM UserTransaction").fetchone()
+    first_doc = COLL.find_one({}, {"_id": 1}, sort=[("_id", 1)])
+    last_doc = COLL.find_one({}, {"_id": 1}, sort=[("_id", -1)])
 
-    if first is None:
+    if first_doc is None:
         print("The table is empty.")
         return None
+    first, last = first_doc["_id"], last_doc["_id"]
     text = ask(f"TID of the row (from {first:,} to {last:,}; 'view results' shows "
                f"TIDs; Enter cancels): ", []).replace(",", "")
-    
+
     if text == "":
         return None
-    
+
     if not text.isdigit():
         print("A TID is a whole number.")
         return None
 
-    columns = ", ".join(column for _, column in RESULT_COLUMNS)
-    row = CONN.execute(f"SELECT {columns} {FROM_SQL}WHERE u.TID = ?", [int(text)]).fetchone()
+    doc = COLL.find_one({"_id": int(text)}, RESULT_PROJECTION)
 
-    if row is None:
+    if doc is None:
         print(f"No row has TID {int(text):,} (it may have been deleted).")
         return None
 
     print()
     print_table([heading for heading, _ in RESULT_COLUMNS],
-                [format_result_row(row)], NUMBER_HEADINGS)
+                [format_result_row(doc)], NUMBER_HEADINGS)
     print()
 
-    return {"where": "TID = ?", "params": [int(text)], "count": 1,
+    return {"query": {"_id": int(text)}, "count": 1,
             "text": f"row {int(text):,}", "everything": False}
 
 
@@ -763,17 +786,17 @@ def scope_filtered():
         print("No rows match the current filters.")
         return None
 
-    where, params = build_where()
+    query = build_query()
 
-    if where:
+    if query:
         print("Rows matching the current filters:")
         print("\n".join(describe_filters()))
     else:
         print("WARNING: no filters are set, so this would affect EVERY row.")
 
-    # The subquery reuses the same joins as the searches, so every filter works
-    return {"where": f"TID IN (SELECT u.TID {FROM_SQL}{where})", "params": params,
-            "count": total, "text": f"{total:,} rows", "everything": not where}
+    # The same filter document the searches use, so every filter works
+    return {"query": query, "count": total, "text": f"{total:,} rows",
+            "everything": not query}
 
 
 def confirmation_word(scope):
@@ -791,7 +814,7 @@ def confirm(scope):
     if answer.lower() != word.replace(",", "").lower():
         print("Cancelled. Nothing was changed.")
         return False
-    
+
     return True
 
 
@@ -802,20 +825,22 @@ def ask_whole_number(prompt, low, high):
 
         if text == "":
             return None
-        
+
         if text.isdigit() and low <= int(text) <= high:
             return int(text)
-        
+
         print(f"  Please type a whole number from {low:,} to {high:,}.")
 
 
 def choose_library_code(name):
     """Several library codes can share one name (r3, r3aaa, r3j are all
-    Richmond), so ask which code to store. Enter = the first (shortest) one."""
-    codes = [row[0] for row in CONN.execute(
-        "SELECT home_library_code FROM HomeLibType WHERE home_library_name = ? "
-        "ORDER BY length(home_library_code), home_library_code", [name])]
-    
+    Richmond), so ask which code to store. Enter = the first (shortest) one.
+    Returns the code, or None for "no code" (a blank code is a missing field)."""
+    codes = sorted(COLL.distinct("library.code", {"library.name": name}),
+                   key=lambda code: (len(code), code))
+    if COLL.count_documents({"library.name": name, "library.code": None}, limit=1):
+        codes.insert(0, None)
+
     if len(codes) == 1:
         return codes[0]
 
@@ -824,7 +849,7 @@ def choose_library_code(name):
 
     while True:
         text = ask(f"  Which code? [{shown[0]}]: ", shown)
-        
+
         if text == "":
             return codes[0]
         match = match_option(text, shown)
@@ -856,25 +881,28 @@ def export_csv():
         print("Export cancelled.")
         return
 
-    where, params = build_where()
-    columns = ", ".join(column for _, column in RESULT_COLUMNS)
-    cursor = CONN.execute(f"SELECT {columns} {FROM_SQL}{where}{order_by()}", params)
-
     with open(path, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow([heading for heading, _ in RESULT_COLUMNS])
 
-        for row in cursor:
-            writer.writerow(format_result_row(row))
-    
+        for doc in fetch_rows(build_query()):
+            writer.writerow(format_result_row(doc))
+
     print(f"Wrote {total:,} rows to {path}")
 
 
+def set_or_unset(path, value):
+    """The update document that stores `value` at `path`, or removes the field
+    when value is None (blank values are left out of documents, not stored)."""
+    return {"$unset": {path: ""}} if value is None else {"$set": {path: value}}
+
+
 def ask_new_value(field):
-    """Asks for the new value of one field. Returns (column, value, text to
-    show) or None if cancelled. `column` is always one of our own column names."""
+    """Asks for the new value of one field. Returns (update document, text to
+    show) or None if cancelled. The field paths in the update document are
+    always our own names; the user's input is only ever a value."""
     if field in NUMERIC_FIELDS:
-        
+
         low, high = RANGES[field]
         if field == "year registered":
             allowed = (MIN_YEAR, datetime.now().year)
@@ -882,12 +910,12 @@ def ask_new_value(field):
             allowed = (0, MAX_COUNT)
         number = ask_whole_number(f"New {field} (the database now has {low} to "
                                   f"{high}; Enter cancels): ", *allowed)
-        
+
         if number is None:
             return None
-        
+
         text = str(number) if field == "year registered" else f"{number:,}"
-        return plain_column(NUMERIC_FIELDS[field]), number, text
+        return {"$set": {NUMERIC_FIELDS[field]: number}}, text
 
     options = CHOICES[field]
     print_in_columns(options)
@@ -896,28 +924,31 @@ def ask_new_value(field):
 
         if text == "":
             return None
-        
+
         shown = match_option(text, options)
         if shown is not None:
             break
 
         print("  Not one of the values above.")
 
-    # Turn what the user picked into the code that is stored in the table
     if field == BOOLEAN_FIELD:
-        return "within_sf", 1 if shown == "yes" else 0, shown
+        return {"$set": {BOOLEAN_PATH: shown == "yes"}}, shown
     if field == "age ranges":
-        return "age_range", sql_value(field, shown), shown
+        return set_or_unset("patron.age_range", stored_value(field, shown)), shown
+
+    # The other fields are a code + its definition stored side by side in a
+    # sub-document, so look up the code and change BOTH together
     if field == "patron types":
-        code = CONN.execute("SELECT DISTINCT patron_type_code FROM PatronType "
-                            "WHERE patron_type_definition = ?", [shown]).fetchone()[0]
-        return "patron_type_code", code, shown
+        code = COLL.find_one({"patron.type": shown}, {"patron.code": 1})["patron"]["code"]
+        return {"$set": {"patron.code": code, "patron.type": shown}}, shown
     if field == "library names":
         code = choose_library_code(shown)
-        return "home_library_code", code, f"{shown} (code {code or '(blank)'})"
-    code = CONN.execute("SELECT notification_medium_code FROM NotificationType "
-                        "WHERE notification_medium_definition = ?", [shown]).fetchone()[0]
-    return "notification_medium_code", code, shown
+        update = set_or_unset("library.code", code)
+        update.setdefault("$set", {})["library.name"] = shown
+        return update, f"{shown} (code {code or '(blank)'})"
+    code = COLL.find_one({"notification.medium": shown},
+                         {"notification.code": 1})["notification"]["code"]
+    return {"$set": {"notification.code": code, "notification.medium": shown}}, shown
 
 
 def update_rows(scope):
@@ -942,28 +973,17 @@ def update_rows(scope):
     if new is None:
         print("Cancelled. Nothing was changed.")
         return
-    column, value, shown = new
+    update, shown = new
 
     print(f"\nThis will set {field} to '{shown}' for {scope['text']}.")
     if not confirm(scope):
         return
 
-    writer = open_writable()
-    try:
-        # `with` saves (commits) if the UPDATE works and undoes it (rolls back)
-        # if anything goes wrong, so a change is applied to all rows or to none
-        with writer:
-            changed = writer.execute(
-                f"UPDATE UserTransaction SET {column} = ? WHERE {scope['where']}",
-                [value] + scope["params"],
-            ).rowcount
-    except sqlite3.IntegrityError:
-        print("Nothing was changed: that value is not allowed for at least one of "
-              "these rows.\n(The patron type and age range together have to be a "
-              "combination that already exists in the database.)")
-        return
-    finally:
-        writer.close()
+    # Each document is changed completely or not at all, but (unlike the SQLite
+    # app's transaction) update_many is NOT all-or-nothing across documents: if
+    # the server stops halfway, the documents already changed stay changed.
+    # matched_count = documents found by the filter (what SQLite's rowcount gives)
+    changed = writable_collection().update_many(scope["query"], update).matched_count
 
     print(f"Updated {changed:,} row(s).")
     refresh_after_change()
@@ -974,21 +994,14 @@ def delete_rows(scope):
     if scope is None:
         return
 
-    print(f"This will permanently DELETE {scope['text']} from library.db.")
-    print("(To get the original data back, close the app, delete library.db and "
-          "start the app again: it rebuilds the database from the CSV file.)")
-    
+    print(f"This will permanently DELETE {scope['text']} from {DATABASE_NAME}.{COLLECTION_NAME}.")
+    print("(To get the original data back, close the app and run init_db.py: it "
+          f"rebuilds this collection from {RAW_COLLECTION_NAME}.)")
+
     if not confirm(scope):
         return
 
-    writer = open_writable()
-    try:
-        with writer:
-            deleted = writer.execute(
-                f"DELETE FROM UserTransaction WHERE {scope['where']}", scope["params"]
-            ).rowcount
-    finally:
-        writer.close()
+    deleted = writable_collection().delete_many(scope["query"]).deleted_count
 
     print(f"Deleted {deleted:,} row(s).")
     refresh_after_change()
@@ -1057,38 +1070,39 @@ def resolve_command(text):
 # ------------------------------------------------------ MAIN LOOP ---------------------------------------------------------
 
 def main():
-    global CONN
+    global CLIENT
     setup_readline()
-    CONN = startup()
+    CLIENT = startup()
 
-    print(f"{TOTAL_ROWS:,} rows loaded. Type 'help' for the commands, and press [Tab] to autocomplete.")
-    while True:
-        try:
-            line = ask("> ")
-        except EOFError:            # Ctrl-D
-            print()
-            break
-        except KeyboardInterrupt:   # Ctrl-C
-            print("\n(Type 'exit' to leave.)")
-            continue
-        if line == "":
-            continue
+    try:
+        print(f"{TOTAL_ROWS:,} rows loaded. Type 'help' for the commands, and press [Tab] to autocomplete.")
+        while True:
+            try:
+                line = ask("> ")
+            except EOFError:            # Ctrl-D
+                print()
+                break
+            except KeyboardInterrupt:   # Ctrl-C
+                print("\n(Type 'exit' to leave.)")
+                continue
+            if line == "":
+                continue
 
-        command = resolve_command(line)
-        if command is None:
-            guesses = difflib.get_close_matches(line.lower(), COMMANDS, n=3, cutoff=0.5)
-            print(f"Unknown command: '{line}'." +
-                  (f" Did you mean: {', '.join(guesses)}?" if guesses else " Type 'help'."))
-            continue
+            command = resolve_command(line)
+            if command is None:
+                guesses = difflib.get_close_matches(line.lower(), COMMANDS, n=3, cutoff=0.5)
+                print(f"Unknown command: '{line}'." +
+                      (f" Did you mean: {', '.join(guesses)}?" if guesses else " Type 'help'."))
+                continue
 
-        try:
-            COMMANDS[command][0]()
-        except (KeyboardInterrupt, EOFError):
-            print("\n(cancelled)")
-        except sqlite3.Error as error:
-            print(f"Database error: {error}")
-
-    CONN.close()
+            try:
+                COMMANDS[command][0]()
+            except (KeyboardInterrupt, EOFError):
+                print("\n(cancelled)")
+            except PyMongoError as error:
+                print(f"Database error: {error}")
+    finally:
+        CLIENT.close()   # also runs when 'exit' raises SystemExit
 
 
 if __name__ == "__main__":

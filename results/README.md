@@ -12,7 +12,7 @@ Did we store the data in our database appropriately?
 
 This is meant to be a more manageable database with multiple tables. We are not simply dumping the whole Excel sheet into one giant MySQL table.
 
-All figures below were measured on the unmodified `library.db` (SQLite, 437,115 rows). Every number can be reproduced with the app (`view stats`, with breakdowns) or with `sqlite3 library.db`.
+All figures below were measured on the unmodified `library.db` (SQLite, 437,115 rows) and the unmodified `library_database` (MongoDB, 437,115 rows). Every number can be reproduced with the app (`view stats`, with breakdowns) or with `sqlite3 library.db`/`mongosh library_database`.
 
 ## Findings
 
@@ -77,27 +77,44 @@ Observations:
 | File | Size | Contents |
 |---|---:|---|
 | `library_basic.db` | 33.7 MB | the spreadsheet loaded as-is into one table (14 columns) |
-| `library.db` | 16.1 MB | the same rows in four related tables |
+| `library.db`       | 16.1 MB | the same rows in four related tables                     |
 
-Splitting the repeated text (patron type definitions, library names, notification definitions) into lookup tables makes the database about 52% smaller than the single-table version (16.1 MB vs 33.7 MB), while every row can still be joined back to its definitions. The lookup tables hold only 134, 68, and 4 rows.
+Splitting the repeated text (patron type definitions, library names, notification definitions) into lookup tables makes the database about **52%** smaller than the single-table version (16.1 MB vs 33.7 MB), while every row can still be joined back to its definitions. The lookup tables hold only 134, 68, and 4 rows.
+
+| File              | BSON Size | Compressed Size | Contents                                                 |
+| ----------------- | --------: | --------------: | -------------------------------------------------------- |
+| `library_basic` |  182.6 MB |         30.4 MB | the spreadsheet loaded as-is into one table (14 columns) |
+| `library`       |  133.3 MB |         24.2 MB | documents with shorter field names and nested fields     |
+
+Reducing the number of characters taken by field names through reduction (e.g., `within_san_francisco` -> `within_sf`) and nested fields (e.g., `patron_type_code`, `patron_type_definition` -> `patron`: {`code`, `definition`}) made the size of the database about **26%** smaller than the single table version (24.2 MB vs 30.4 MB). The tables could be made even smaller by creating lookup tables, similar to the SQLite implementation, at the cost of an additional `$lookup` or in-memory dictionary.
 
 ### Query time
 
-The query "average checkouts of Richmond patrons aged 25 to 34" (3,599 rows) joins `UserTransaction` to `HomeLibType`. It took 0.03 s in each of three runs (`sqlite3`, whole process including start-up), over the full 437,115-row table. The plan scans `UserTransaction` once and looks up each library code through the primary-key index of `HomeLibType`.
+The query "average checkouts of Richmond patrons aged 25 to 34" (3,599 rows) joins `UserTransaction` to `HomeLibType`. It took **0.03 s** in each of three runs (`sqlite3`, whole process including start-up), over the full 437,115-row table. The plan scans `UserTransaction` once and looks up each library code through the primary-key index of `HomeLibType`.
+
+The same query on a single `library` table took an average of **0.07 s** in each of three runs (`mongodb`, whole process including network round trip), over the full 437,115-row table. The plan scans the `library` table once, matching for `Richmond` patrons between 25 and 34, before processing matched rows.
 
 ### Building the database
 
-`gleam run` (create the tables, load all 437,115 CSV rows, fill the normalised tables) took 13 s when the dependencies were already compiled, and around 25 s on a first run from a clean copy, which includes about 10 s of compiling. The inserts are fast because they all share one transaction.
+`gleam run` (create the tables, load all 437,115 CSV rows, fill the normalised tables) took **13 s** when the dependencies were already compiled, and around **25 s** on a first run from a clean copy, which includes about 10 s of compiling. The inserts are fast because they all share one transaction.
+
+`import_csv.py` (creates the database and raw table, loads all CSV rows, verifies rows) and`init_db.py` (creates the `library` table and loads raw rows) took 5.1 and 4.5 s, respectively, for a total of **9.5 s**. 
 
 ### App speed
 
-On the full table (437,115 rows, no filters), `view stats` takes 0.63 s (including starting the app and reading all three numeric columns to compute medians and percentiles), and showing the first page of `view results` takes 0.21 s.
+In SQLIte, on the full table (437,115 rows, no filters), `view stats` takes **0.63 s** (including starting the app and reading all three numeric columns to compute medians and percentiles), and showing the first page of `view results` takes **0.21 s**.
+
+In MongoDB, on the full table (437,115 rows, no filters), `view stats` takes **1.65 s** (including starting the app and reading all three numeric columns to compute medians and percentiles), and showing the first page of `view results` takes **1.14 s**.
 
 ### Not done yet
 
 - **No secondary indexes.** Only the primary-key indexes exist (`PatronType`, `HomeLibType`, `NotificationType`). Queries are fast enough at this size, but indexes on the `UserTransaction` foreign-key columns (and on the columns the app filters on) have not been added or measured, so there is no before/after comparison yet.
 - **Not MySQL.** The figures are for SQLite. Re-measuring on MySQL/MariaDB (with and without indexes, using `EXPLAIN`) is the main remaining work for this assignment.
 
+
+
+- **No indexes.** For the MongoDB implementation, no indexes were created or used, meaning reads, sorting and filtering were slower than they would have been. 
+
 ## Exported results
 
-Files written by the app's `export` command are saved in this folder as `export_<date>_<time>.csv`.
+Files written by the app's `export` command are saved in this folder as `export_<date>_<time>.csv` or by the name of your choice.
